@@ -1,0 +1,53 @@
+
+name: Chopin Stock Kernel Build Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git make bc bison flex libssl-dev \
+            libelf-dev build-essential python3 \
+            cpio lz4 zip unzip
+
+      - name: Clone chopin source
+        run: |
+          git clone --depth=1 --branch T \
+            https://github.com/ChopinKernels/android_kernel_chopin_android_T.git kernel
+
+      - name: Install LLVM toolchain
+        run: |
+          sudo apt-get install -y clang lld llvm
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          make O=out ARCH=arm64 LLVM=1 chopin_user_defconfig
+          test -f out/.config
+
+      - name: Compile kernel
+        working-directory: kernel
+        run: |
+          make -j2 O=out ARCH=arm64 LLVM=1 \
+            Image.gz-dtb 2>&1 | tee build.log
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopin-build-logs
+          path: |
+            kernel/build.log
+            kernel/out/.config
+          if-no-files-found: warn
