@@ -1,0 +1,41 @@
+
+name: Chopin Android 13 Source Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check source branch
+        run: |
+          git ls-remote --exit-code \
+            https://github.com/ChopinKernels/android_kernel_chopin_android_T.git \
+            refs/heads/T
+
+      - name: Inspect kernel build files
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://raw.githubusercontent.com/ChopinKernels/android_kernel_chopin_android_T/T"
+
+          echo "=== Kernel Makefile ==="
+          curl -fsSL "$BASE/Makefile" |
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) ='
+
+          echo "=== MTK build configuration ==="
+          curl -fsSL "$BASE/build.config.mtk.aarch64" |
+            head -n 50
+
+          echo "=== ARM64 defconfig candidates ==="
+          curl -fsSL \
+            "https://api.github.com/repos/ChopinKernels/android_kernel_chopin_android_T/contents/arch/arm64/configs?ref=T" |
+            jq -r '.[].name' |
+            grep -Ei 'chopin|mtk|mt68|defconfig' |
+            head -n 40
