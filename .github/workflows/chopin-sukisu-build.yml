@@ -1,0 +1,174 @@
+name: Chopin SukiSU Ultra v4.3.0-r2 Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [chopin-sukisu]
+    paths: [.github/workflows/chopin-sukisu-build.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl \
+            device-tree-compiler flex git libelf-dev \
+            libncurses-dev libssl-dev lz4 make python3 tar
+
+      - name: Download Android Clang
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clang"
+          curl -fLsS --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r383902.tar.gz" \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/clang/lib64" >> "$GITHUB_ENV"
+
+      - name: Download and validate candidate Android GCC 4.9
+        run: |
+          set -euo pipefail
+          base=https://android.googlesource.com/platform/prebuilts/gcc/linux-x86
+          tag=android-9.0.0_r1
+
+          for toolchain in \
+            aarch64/aarch64-linux-android-4.9 \
+            arm/arm-linux-androideabi-4.9; do
+            dest="$RUNNER_TEMP/${toolchain##*/}"
+            mkdir -p "$dest"
+            echo "=== $toolchain at $tag ==="
+            curl -fLsS --retry 3 \
+              "$base/$toolchain/+archive/refs/tags/$tag.tar.gz" \
+              -o "$dest/toolchain.tar.gz"
+            tar -xzf "$dest/toolchain.tar.gz" -C "$dest"
+
+            find "$dest" -path '*/bin/*' \
+              \( -name '*-gcc' -o -name '*-elfedit' \) -ls
+
+            compiler="$dest/bin/${toolchain##*/}"
+            compiler="${compiler%-4.9}-gcc"
+            if [[ ! -x "$compiler" ]]; then
+              echo "::error::Missing executable $compiler"
+              exit 1
+            fi
+            prefix="${compiler%gcc}"
+            echo "Compiler: $compiler"
+            "$compiler" --version
+            target=$("$compiler" -dumpmachine)
+            echo "Target: $target"
+
+            case "$toolchain:$target" in
+              aarch64/*:aarch64-*)
+                test -x "${prefix}elfedit" || {
+                  echo "::error::Missing executable ${prefix}elfedit"
+                  exit 1
+                }
+                echo "CROSS_COMPILE=$prefix" >> "$GITHUB_ENV"
+                ;;
+              arm/*:arm-*)
+                echo "CROSS_COMPILE_ARM32=$prefix" >> "$GITHUB_ENV"
+                ;;
+              *)
+                echo "::error::Unexpected compiler target $target for $toolchain"
+                exit 1
+                ;;
+            esac
+            dirname "$compiler" >> "$GITHUB_PATH"
+          done
+
+      - name: Verify Clang and LLD
+        run: |
+          set -euo pipefail
+          clang --version
+          ld.lld --version
+
+      - name: Clone pinned stock source
+        run: |
+          set -euo pipefail
+          git init kernel
+          git -C kernel remote add origin \
+            https://github.com/ChopinKernels/android_kernel_chopin_android_T.git
+          git -C kernel fetch --depth=1 origin \
+            0647a49c9557faa92b90c4ae188587787226be9e
+          git -C kernel checkout --detach FETCH_HEAD
+          git -C kernel rev-parse HEAD
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
+
+      - name: Integrate pinned SukiSU Ultra
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          git init KernelSU
+          git -C KernelSU fetch https://github.com/SukiSU-Ultra/SukiSU-Ultra.git 645ef9860b9b7f900bb5d1b27e224f2c311d39c0
+          git -C KernelSU checkout --detach FETCH_HEAD
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+
+      - name: Configure and compile SukiSU Ultra kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          args=(
+            ARCH=arm64
+            HOSTCC=gcc HOSTCXX=g++
+            CC=clang LD=ld.lld
+            AR=llvm-ar NM=llvm-nm
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
+          )
+
+          make O=out "${args[@]}" chopin_user_defconfig 2>&1 | tee build.log
+          test -s out/.config
+
+          scripts/config --file out/.config --set-str LOCALVERSION "-SukiSU"\
+            --enable OVERLAY_FS \
+            --enable KPROBES --enable KPROBE_EVENTS --enable KSU --enable EXT4_FS --enable KRETPROBES
+          make O=out "${args[@]}" olddefconfig 2>&1 | tee -a build.log
+          for option in OVERLAY_FS KPROBES KPROBE_EVENTS EXT4_FS KRETPROBES KSU; do
+            grep -x "CONFIG_${option}=y" out/.config | tee -a build.log
+          done
+
+          make -j"$(nproc)" O=out "${args[@]}" Image.gz-dtb 2>&1 | tee -a build.log
+
+          awk '$3 == "kernelsu_init" { found=1; print } END { exit !found }' out/System.map | tee -a build.log
+          image=out/arch/arm64/boot/Image.gz-dtb
+          test -s "$image"
+          ls -lh "$image" | tee -a build.log
+          sha256sum "$image" | tee -a build.log
+
+      - name: Upload verified SukiSU Ultra kernel image
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopin-sukisu-kernel-image
+          path: kernel/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: error
+
+      - name: Upload SukiSU Ultra kernel logs and configuration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopin-sukisu-build-evidence
+          path: |
+            kernel/build.log
+            kernel/out/.config
+            kernel/out/System.map
+          include-hidden-files: true
+          if-no-files-found: warn
+
