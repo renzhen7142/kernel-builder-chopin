@@ -146,7 +146,7 @@ jobs:
 
           make -j"$(nproc)" O=out "${args[@]}" Image.gz-dtb 2>&1 | tee -a build.log
 
-          awk '$3 == "ksu_init" { found=1; print } END { exit !found }' out/System.map | tee -a build.log
+          awk '$3 == "kernelsu_init" { found=1; print } END { exit !found }' out/System.map | tee -a build.log
           image=out/arch/arm64/boot/Image.gz-dtb
           test -s "$image"
           ls -lh "$image" | tee -a build.log
