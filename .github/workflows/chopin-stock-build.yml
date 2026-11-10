@@ -13,41 +13,148 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            git make bc bison flex libssl-dev \
-            libelf-dev build-essential python3 \
-            cpio lz4 zip unzip
+            bc bison build-essential ccache curl \
+            device-tree-compiler flex git libelf-dev \
+            libncurses-dev libssl-dev lz4 make \
+            python3 tar unzip zip
 
-      - name: Clone chopin source
+      - name: Download Android Clang
         run: |
-          git clone --depth=1 --branch T \
-            https://github.com/ChopinKernels/android_kernel_chopin_android_T.git kernel
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clang"
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r383902.tar.gz" \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" \
+            -C "$RUNNER_TEMP/clang"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/clang/lib64" >> "$GITHUB_ENV"
 
-      - name: Install LLVM toolchain
+      - name: Download Android GCC 4.9
         run: |
-          sudo apt-get install -y clang lld llvm
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gcc64" "$RUNNER_TEMP/gcc32"
 
-      - name: Configure kernel
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" \
+            -o "$RUNNER_TEMP/gcc64.tar.gz"
+
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" \
+            -o "$RUNNER_TEMP/gcc32.tar.gz"
+
+          tar -xzf "$RUNNER_TEMP/gcc64.tar.gz" \
+            -C "$RUNNER_TEMP/gcc64"
+          tar -xzf "$RUNNER_TEMP/gcc32.tar.gz" \
+            -C "$RUNNER_TEMP/gcc32"
+
+          echo "$RUNNER_TEMP/gcc64/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/gcc32/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchains
+        run: |
+          set -euo pipefail
+          clang --version
+          ld.lld --version
+          aarch64-linux-android-gcc --version
+          arm-linux-androideabi-gcc --version
+
+      - name: Clone pinned source
+        run: |
+          set -euo pipefail
+          git init kernel
+          git -C kernel remote add origin \
+            https://github.com/ChopinKernels/android_kernel_chopin_android_T.git
+          git -C kernel fetch --depth=1 origin \
+            0647a49c9557faa92b90c4ae188587787226be9e
+          git -C kernel checkout --detach FETCH_HEAD
+
+          git -C kernel rev-parse HEAD
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
+
+      - name: Configure original kernel
         working-directory: kernel
         run: |
-          make O=out ARCH=arm64 LLVM=1 chopin_user_defconfig
-          test -f out/.config
+          set -euo pipefail
+          make O=out ARCH=arm64 \
+            HOSTCC=gcc HOSTCXX=g++ \
+            chopin_user_defconfig
 
-      - name: Compile kernel
+          test -s out/.config
+
+          echo "=== Kernel configuration ==="
+          grep -E 'KPROBES|KRETPROBES|EXT4_FS|KALLSYMS|MODULES' \
+            out/.config || true
+
+      - name: Test Kprobes feasibility
         working-directory: kernel
         run: |
-          make -j2 O=out ARCH=arm64 LLVM=1 \
+          set -euo pipefail
+          make O=out-kprobe ARCH=arm64 \
+            HOSTCC=gcc HOSTCXX=g++ \
+            chopin_user_defconfig
+
+          scripts/config --file out-kprobe/.config \
+            --enable KPROBES \
+            --enable KRETPROBES \
+            --enable EXT4_FS \
+            --enable KALLSYMS \
+            --enable KALLSYMS_ALL
+
+          make O=out-kprobe ARCH=arm64 \
+            HOSTCC=gcc HOSTCXX=g++ olddefconfig
+
+          echo "=== Resolved Kprobes configuration ==="
+          grep -E 'KPROBES|KRETPROBES|EXT4_FS|KALLSYMS' \
+            out-kprobe/.config || true
+
+          if grep -q '^CONFIG_KPROBES=y$' out-kprobe/.config; then
+            echo "KPROBES_FEASIBLE=yes"
+          else
+            echo "KPROBES_FEASIBLE=no"
+          fi
+
+      - name: Compile original kernel
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PATH="$RUNNER_TEMP/clang/bin:$RUNNER_TEMP/gcc64/bin:$RUNNER_TEMP/gcc32/bin:$PATH"
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/clang/lib64:${LD_LIBRARY_PATH:-}"
+
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            HOSTCC=gcc HOSTCXX=g++ \
+            CC=clang LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             Image.gz-dtb 2>&1 | tee build.log
 
-      - name: Upload build logs
+          test -s out/arch/arm64/boot/Image.gz-dtb
+
+          echo "=== BUILD ARTIFACT ==="
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
+          sha256sum out/arch/arm64/boot/Image.gz-dtb
+
+      - name: Upload build evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: chopin-build-logs
+          name: chopin-stock-build-evidence
           path: |
             kernel/build.log
             kernel/out/.config
+            kernel/out/System.map
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel/out-kprobe/.config
           if-no-files-found: warn
