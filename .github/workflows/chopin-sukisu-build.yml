@@ -119,6 +119,60 @@ jobs:
           echo '4e74a6beccf82890c691ff79ad7fac5156e7c164b51ff46f87986f8f0459eeb2  KernelSU/kernel/kernel_includes.h' | sha256sum -c -
           test -f include/linux/static_key.h
           sed -i 's@#include <linux/static_call.h>@#include <linux/static_key.h>@' KernelSU/kernel/kernel_includes.h
+          cat > /tmp/sukisu-optional-compat.patch <<'SUKISU_COMPAT_PATCH'
+          --- a/kernel/ksu_main.c
+          +++ b/kernel/ksu_main.c
+          @@ -77,7 +77,7 @@
+           
+           // unity build
+           #include "extension/extension.c"
+          -#include "extension/cpu_spoof.c"
+          +/* CPU spoof unavailable on chopin 4.14. */
+           #include "extension/umount_paths.c"
+           #include "extension/dynamic_manager.c"
+           #include "extension/kpm.c"
+          --- a/kernel/extension/extension.c
+          +++ b/kernel/extension/extension.c
+          @@ -524,14 +524,6 @@
+                   .ops = &ksu_extension_kpm_ops,
+                   .io_handler = ksu_extension_kpm_io,
+                   .apply_forced = ksu_extension_kpm_apply_forced,
+          -    };
+          -    static const struct ksu_extension_handler cpu_spoof_handler = {
+          -        .extension_id = KSU_EXTENSION_CPU_SPOOF,
+          -        .name = "cpu_spoof",
+          -        /* State lives in each ioctl payload; nothing to toggle or keep. */
+          -        .caps = 0,
+          -        .ops = NULL,
+          -        .io_handler = ksu_extension_cpu_spoof_io,
+               };
+               static const struct ksu_extension_handler umount_paths_handler = {
+                   .extension_id = KSU_EXTENSION_UMOUNT_PATHS,
+          @@ -576,8 +568,7 @@
+           
+               if (ksu_register_extension_handler(&kpm_handler))
+                   pr_err("extension: failed to register kpm\n");
+          -    if (ksu_register_extension_handler(&cpu_spoof_handler))
+          -        pr_err("extension: failed to register cpu_spoof\n");
+          +    /* CPU spoof is not advertised on this build. */
+               if (ksu_register_extension_handler(&umount_paths_handler))
+                   pr_err("extension: failed to register umount_paths\n");
+               if (ksu_register_extension_handler(&dynamic_manager_handler))
+          --- a/kernel/preinit/common/preinit.h
+          +++ b/kernel/preinit/common/preinit.h
+          @@ -2,7 +2,9 @@
+           #define __KSU_H_PREINIT
+           
+           #if !defined(CONFIG_ARM64) || !defined(KSU_CAN_USE_JUMP_LABEL)
+          +#ifndef KSU_NO_PREINIT
+           #define KSU_NO_PREINIT
+          +#endif
+           #endif
+           
+           #ifndef KSU_NO_PREINIT
+          SUKISU_COMPAT_PATCH
+          git -C KernelSU apply --check /tmp/sukisu-optional-compat.patch
+          git -C KernelSU apply /tmp/sukisu-optional-compat.patch
           ln -s ../KernelSU/kernel drivers/kernelsu
           printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
