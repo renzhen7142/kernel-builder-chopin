@@ -56,15 +56,12 @@ jobs:
             find "$dest" -path '*/bin/*' \
               \( -name '*-gcc' -o -name '*-elfedit' \) -ls
 
-            mapfile -t compilers < <(
-              find "$dest" -path '*/bin/*-gcc' -executable | sort
-            )
-            if (( ${#compilers[@]} != 1 )); then
-              echo "::error::Expected one executable GCC in $toolchain, found ${#compilers[@]}"
+            compiler="$dest/bin/${toolchain##*/}"
+            compiler="${compiler%-4.9}-gcc"
+            if [[ ! -x "$compiler" ]]; then
+              echo "::error::Missing executable $compiler"
               exit 1
             fi
-
-            compiler="${compilers[0]}"
             prefix="${compiler%gcc}"
             echo "Compiler: $compiler"
             "$compiler" --version
