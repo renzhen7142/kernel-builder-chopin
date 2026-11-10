@@ -115,6 +115,10 @@ jobs:
           git init KernelSU
           git -C KernelSU fetch https://github.com/SukiSU-Ultra/SukiSU-Ultra.git de9bc7e6b46181f8b27ac7b96db946420838dd18
           git -C KernelSU checkout --detach FETCH_HEAD
+          # This pinned builtin source uses static keys, not static-call APIs.
+          echo '4e74a6beccf82890c691ff79ad7fac5156e7c164b51ff46f87986f8f0459eeb2  KernelSU/kernel/kernel_includes.h' | sha256sum -c -
+          test -f include/linux/static_key.h
+          sed -i 's@#include <linux/static_call.h>@#include <linux/static_key.h>@' KernelSU/kernel/kernel_includes.h
           ln -s ../KernelSU/kernel drivers/kernelsu
           printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
