@@ -257,6 +257,10 @@ jobs:
           # init/version.o owns generation of include/generated/compile.h in this tree.
           make O=out "${args[@]}" init/version.o 2>&1 | tee -a build.log
           test -s out/include/generated/compile.h
+          # Build SELinux first: its Makefile generates flask.h and av_permissions.h.
+          make -j"$(nproc)" O=out "${args[@]}" security/selinux/ 2>&1 | tee -a build.log
+          test -s out/security/selinux/flask.h
+          test -s out/security/selinux/av_permissions.h
           # Fail early on integration/API errors before compiling the whole kernel.
           make -j"$(nproc)" O=out "${args[@]}" drivers/kernelsu/ 2>&1 | tee -a build.log
           make -j"$(nproc)" O=out "${args[@]}" fs/exec.o fs/open.o fs/stat.o fs/read_write.o kernel/reboot.o 2>&1 | tee -a build.log
