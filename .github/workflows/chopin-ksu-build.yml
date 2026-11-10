@@ -55,3 +55,118 @@ jobs:
               "$base/$toolchain/+archive/refs/tags/$tag.tar.gz" \
               -o "$dest/toolchain.tar.gz"
             tar -xzf "$dest/toolchain.tar.gz" -C "$dest"
+
+            find "$dest" -path '*/bin/*' \
+              \( -name '*-gcc' -o -name '*-elfedit' \) -ls
+
+            compiler="$dest/bin/${toolchain##*/}"
+            compiler="${compiler%-4.9}-gcc"
+            if [[ ! -x "$compiler" ]]; then
+              echo "::error::Missing executable $compiler"
+              exit 1
+            fi
+            prefix="${compiler%gcc}"
+            echo "Compiler: $compiler"
+            "$compiler" --version
+            target=$("$compiler" -dumpmachine)
+            echo "Target: $target"
+
+            case "$toolchain:$target" in
+              aarch64/*:aarch64-*)
+                test -x "${prefix}elfedit" || {
+                  echo "::error::Missing executable ${prefix}elfedit"
+                  exit 1
+                }
+                echo "CROSS_COMPILE=$prefix" >> "$GITHUB_ENV"
+                ;;
+              arm/*:arm-*)
+                echo "CROSS_COMPILE_ARM32=$prefix" >> "$GITHUB_ENV"
+                ;;
+              *)
+                echo "::error::Unexpected compiler target $target for $toolchain"
+                exit 1
+                ;;
+            esac
+            dirname "$compiler" >> "$GITHUB_PATH"
+          done
+
+      - name: Verify Clang and LLD
+        run: |
+          set -euo pipefail
+          clang --version
+          ld.lld --version
+
+      - name: Clone pinned stock source
+        run: |
+          set -euo pipefail
+          git init kernel
+          git -C kernel remote add origin \
+            https://github.com/ChopinKernels/android_kernel_chopin_android_T.git
+          git -C kernel fetch --depth=1 origin \
+            0647a49c9557faa92b90c4ae188587787226be9e
+          git -C kernel checkout --detach FETCH_HEAD
+          git -C kernel rev-parse HEAD
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
+
+      - name: Integrate pinned KernelSU
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          git init KernelSU
+          git -C KernelSU fetch --depth=1 https://github.com/tiann/KernelSU.git b766b98513b5a7eb33bc1c4a76b5702bf1288f07
+          git -C KernelSU checkout --detach FETCH_HEAD
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+
+      - name: Configure and compile KernelSU kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          args=(
+            ARCH=arm64
+            HOSTCC=gcc HOSTCXX=g++
+            CC=clang LD=ld.lld
+            AR=llvm-ar NM=llvm-nm
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
+          )
+
+          make O=out "${args[@]}" chopin_user_defconfig 2>&1 | tee build.log
+          test -s out/.config
+
+          scripts/config --file out/.config --enable OVERLAY_FS \
+            --enable KPROBES --enable KPROBE_EVENTS --enable KSU
+          make O=out "${args[@]}" olddefconfig 2>&1 | tee -a build.log
+          for option in OVERLAY_FS KPROBES KPROBE_EVENTS KSU; do
+            grep -x "CONFIG_${option}=y" out/.config | tee -a build.log
+          done
+
+          make -j"$(nproc)" O=out "${args[@]}" Image.gz-dtb 2>&1 | tee -a build.log
+
+          awk '$3 == "ksu_init" { found=1; print } END { exit !found }' out/System.map | tee -a build.log
+          image=out/arch/arm64/boot/Image.gz-dtb
+          test -s "$image"
+          ls -lh "$image" | tee -a build.log
+          sha256sum "$image" | tee -a build.log
+
+      - name: Upload verified KernelSU kernel image
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopin-ksu-kernel-image
+          path: kernel/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: error
+
+      - name: Upload KernelSU kernel logs and configuration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopin-ksu-build-evidence
+          path: |
+            kernel/build.log
+            kernel/out/.config
+            kernel/out/System.map
+          include-hidden-files: true
+          if-no-files-found: warn
