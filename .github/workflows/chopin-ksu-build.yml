@@ -1,0 +1,57 @@
+name: Chopin KernelSU v0.9.5 Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [chopin-ksu]
+    paths: [.github/workflows/chopin-ksu-build.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl \
+            device-tree-compiler flex git libelf-dev \
+            libncurses-dev libssl-dev lz4 make python3 tar
+
+      - name: Download Android Clang
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clang"
+          curl -fLsS --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r383902.tar.gz" \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/clang/lib64" >> "$GITHUB_ENV"
+
+      - name: Download and validate candidate Android GCC 4.9
+        run: |
+          set -euo pipefail
+          base=https://android.googlesource.com/platform/prebuilts/gcc/linux-x86
+          tag=android-9.0.0_r1
+
+          for toolchain in \
+            aarch64/aarch64-linux-android-4.9 \
+            arm/arm-linux-androideabi-4.9; do
+            dest="$RUNNER_TEMP/${toolchain##*/}"
+            mkdir -p "$dest"
+            echo "=== $toolchain at $tag ==="
+            curl -fLsS --retry 3 \
+              "$base/$toolchain/+archive/refs/tags/$tag.tar.gz" \
+              -o "$dest/toolchain.tar.gz"
+            tar -xzf "$dest/toolchain.tar.gz" -C "$dest"
