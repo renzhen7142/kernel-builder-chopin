@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Install dependencies
         run: |
@@ -19,61 +23,70 @@ jobs:
           sudo apt-get install -y \
             bc bison build-essential ccache curl \
             device-tree-compiler flex git libelf-dev \
-            libncurses-dev libssl-dev lz4 make \
-            python3 tar unzip zip
+            libncurses-dev libssl-dev lz4 make python3 tar
 
       - name: Download Android Clang
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/clang"
-          curl -fL --retry 3 \
+          curl -fLsS --retry 3 \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r383902.tar.gz" \
             -o "$RUNNER_TEMP/clang.tar.gz"
-          tar -xzf "$RUNNER_TEMP/clang.tar.gz" \
-            -C "$RUNNER_TEMP/clang"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
           echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/clang/lib64" >> "$GITHUB_ENV"
 
-      - name: Download Android GCC 4.9
+      - name: Download and validate candidate Android GCC 4.9
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/gcc64" "$RUNNER_TEMP/gcc32"
+          base=https://android.googlesource.com/platform/prebuilts/gcc/linux-x86
+          tag=android-9.0.0_r1
 
-          curl -fL --retry 3 \
-            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" \
-            -o "$RUNNER_TEMP/gcc64.tar.gz"
+          for toolchain in \
+            aarch64/aarch64-linux-android-4.9 \
+            arm/arm-linux-androideabi-4.9; do
+            dest="$RUNNER_TEMP/${toolchain##*/}"
+            mkdir -p "$dest"
+            echo "=== $toolchain at $tag ==="
+            curl -fLsS --retry 3 \
+              "$base/$toolchain/+archive/refs/tags/$tag.tar.gz" \
+              -o "$dest/toolchain.tar.gz"
+            tar -xzf "$dest/toolchain.tar.gz" -C "$dest"
 
-          curl -fL --retry 3 \
-            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" \
-            -o "$RUNNER_TEMP/gcc32.tar.gz"
+            find "$dest" -path '*/bin/*' \
+              \( -name '*-gcc' -o -name '*-elfedit' \) -ls
 
-          tar -xzf "$RUNNER_TEMP/gcc64.tar.gz" \
-            -C "$RUNNER_TEMP/gcc64"
-          tar -xzf "$RUNNER_TEMP/gcc32.tar.gz" \
-            -C "$RUNNER_TEMP/gcc32"
-
-          for arch in gcc64 gcc32; do
-            mapfile -t compilers < <(find "$RUNNER_TEMP/$arch" -path '*/bin/*-gcc' -executable | sort)
+            mapfile -t compilers < <(
+              find "$dest" -path '*/bin/*-gcc' -executable | sort
+            )
             if (( ${#compilers[@]} != 1 )); then
-              printf '::error::Expected one executable cross GCC in %s archive, found %s\n' "$arch" "${#compilers[@]}"
-              printf '%s\n' "${compilers[@]}"
+              echo "::error::Expected one executable GCC in $toolchain, found ${#compilers[@]}"
               exit 1
             fi
+
             compiler="${compilers[0]}"
             prefix="${compiler%gcc}"
-            printf 'Found %s\n' "$compiler"
+            echo "Compiler: $compiler"
             "$compiler" --version
             target=$("$compiler" -dumpmachine)
-            case "$arch:$target" in
-              gcc64:aarch64-*|gcc32:arm-*) ;;
-              *) echo "::error::Unexpected compiler target $target for $arch"; exit 1 ;;
+            echo "Target: $target"
+
+            case "$toolchain:$target" in
+              aarch64/*:aarch64-*)
+                test -x "${prefix}elfedit" || {
+                  echo "::error::Missing executable ${prefix}elfedit"
+                  exit 1
+                }
+                echo "CROSS_COMPILE=$prefix" >> "$GITHUB_ENV"
+                ;;
+              arm/*:arm-*)
+                echo "CROSS_COMPILE_ARM32=$prefix" >> "$GITHUB_ENV"
+                ;;
+              *)
+                echo "::error::Unexpected compiler target $target for $toolchain"
+                exit 1
+                ;;
             esac
-            if [[ "$arch" == gcc64 ]]; then
-              test -x "${prefix}elfedit"
-              echo "CROSS_COMPILE=$prefix" >> "$GITHUB_ENV"
-            else
-              echo "CROSS_COMPILE_ARM32=$prefix" >> "$GITHUB_ENV"
-            fi
             dirname "$compiler" >> "$GITHUB_PATH"
           done
 
@@ -83,7 +96,7 @@ jobs:
           clang --version
           ld.lld --version
 
-      - name: Clone pinned source
+      - name: Clone pinned stock source
         run: |
           set -euo pipefail
           git init kernel
@@ -92,79 +105,45 @@ jobs:
           git -C kernel fetch --depth=1 origin \
             0647a49c9557faa92b90c4ae188587787226be9e
           git -C kernel checkout --detach FETCH_HEAD
-
           git -C kernel rev-parse HEAD
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
 
-      - name: Configure original kernel
+      - name: Configure and compile stock kernel
         working-directory: kernel
         run: |
           set -euo pipefail
-          make O=out ARCH=arm64 \
-            HOSTCC=gcc HOSTCXX=g++ CC=clang LD=ld.lld \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
-            chopin_user_defconfig
+          args=(
+            ARCH=arm64
+            HOSTCC=gcc HOSTCXX=g++
+            CC=clang LD=ld.lld
+            AR=llvm-ar NM=llvm-nm
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
+          )
 
+          make O=out "${args[@]}" chopin_user_defconfig 2>&1 | tee build.log
           test -s out/.config
 
-          echo "=== Kernel configuration ==="
-          grep -E 'KPROBES|KRETPROBES|EXT4_FS|KALLSYMS|MODULES' \
-            out/.config || true
-
-      - name: Test Kprobes feasibility
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          make O=out-kprobe ARCH=arm64 \
-            HOSTCC=gcc HOSTCXX=g++ CC=clang LD=ld.lld \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
-            chopin_user_defconfig
-
+          # Probe Kprobes in a separate configuration from the stock image.
+          make O=out-kprobe "${args[@]}" chopin_user_defconfig 2>&1 | tee -a build.log
           scripts/config --file out-kprobe/.config \
-            --enable KPROBES \
-            --enable KRETPROBES \
-            --enable EXT4_FS \
-            --enable KALLSYMS \
-            --enable KALLSYMS_ALL
-
-          make O=out-kprobe ARCH=arm64 \
-            HOSTCC=gcc HOSTCXX=g++ CC=clang LD=ld.lld \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" olddefconfig
-
-          echo "=== Resolved Kprobes configuration ==="
-          grep -E 'KPROBES|KRETPROBES|EXT4_FS|KALLSYMS' \
-            out-kprobe/.config || true
-
+            --enable KPROBES --enable KRETPROBES --enable EXT4_FS \
+            --enable KALLSYMS --enable KALLSYMS_ALL
+          make O=out-kprobe "${args[@]}" olddefconfig 2>&1 | tee -a build.log
           if grep -q '^CONFIG_KPROBES=y$' out-kprobe/.config; then
-            echo "KPROBES_FEASIBLE=yes"
+            echo "KPROBES_FEASIBLE=yes" | tee -a build.log
           else
-            echo "KPROBES_FEASIBLE=no"
+            echo "KPROBES_FEASIBLE=no" | tee -a build.log
           fi
 
-      - name: Compile original kernel
-        working-directory: kernel
-        shell: bash
-        run: |
-          set -euo pipefail
+          make -j"$(nproc)" O=out "${args[@]}" Image.gz-dtb 2>&1 | tee -a build.log
 
-          make -j"$(nproc)" O=out ARCH=arm64 \
-            HOSTCC=gcc HOSTCXX=g++ CC=clang LD=ld.lld \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
-            AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            Image.gz-dtb 2>&1 | tee build.log
-
-          test -s out/arch/arm64/boot/Image.gz-dtb
-
-          echo "=== BUILD ARTIFACT ==="
-          ls -lh out/arch/arm64/boot/Image.gz-dtb
-          sha256sum out/arch/arm64/boot/Image.gz-dtb
+          image=out/arch/arm64/boot/Image.gz-dtb
+          test -s "$image"
+          ls -lh "$image" | tee -a build.log
+          sha256sum "$image" | tee -a build.log
 
       - name: Upload verified stock kernel image
         uses: actions/upload-artifact@v4
