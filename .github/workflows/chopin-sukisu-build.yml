@@ -5,7 +5,8 @@ on:
   workflow_dispatch:
   push:
     branches: [chopin-sukisu]
-    paths: [.github/workflows/chopin-sukisu-build.yml]
+    paths:
+      - .github/workflows/chopin-sukisu-build.yml
 
 permissions:
   contents: read
@@ -49,33 +50,37 @@ jobs:
           for toolchain in \
             aarch64/aarch64-linux-android-4.9 \
             arm/arm-linux-androideabi-4.9; do
+
             dest="$RUNNER_TEMP/${toolchain##*/}"
             mkdir -p "$dest"
+
             echo "=== $toolchain at $tag ==="
+
             curl -fLsS --retry 3 \
               "$base/$toolchain/+archive/refs/tags/$tag.tar.gz" \
               -o "$dest/toolchain.tar.gz"
-            tar -xzf "$dest/toolchain.tar.gz" -C "$dest"
 
-            find "$dest" -path '*/bin/*' \
-              \( -name '*-gcc' -o -name '*-elfedit' \) -ls
+            tar -xzf "$dest/toolchain.tar.gz" -C "$dest"
 
             compiler="$dest/bin/${toolchain##*/}"
             compiler="${compiler%-4.9}-gcc"
+
             if [[ ! -x "$compiler" ]]; then
               echo "::error::Missing executable $compiler"
               exit 1
             fi
+
             prefix="${compiler%gcc}"
-            echo "Compiler: $compiler"
+
             "$compiler" --version
             target=$("$compiler" -dumpmachine)
-            echo "Target: $target"
+
+            echo "Compiler target: $target"
 
             case "$toolchain:$target" in
               aarch64/*:aarch64-*)
                 test -x "${prefix}elfedit" || {
-                  echo "::error::Missing executable ${prefix}elfedit"
+                  echo "::error::Missing elfedit"
                   exit 1
                 }
                 echo "CROSS_COMPILE=$prefix" >> "$GITHUB_ENV"
@@ -84,10 +89,11 @@ jobs:
                 echo "CROSS_COMPILE_ARM32=$prefix" >> "$GITHUB_ENV"
                 ;;
               *)
-                echo "::error::Unexpected compiler target $target for $toolchain"
+                echo "::error::Unexpected compiler target $target"
                 exit 1
                 ;;
             esac
+
             dirname "$compiler" >> "$GITHUB_PATH"
           done
 
@@ -100,127 +106,171 @@ jobs:
       - name: Clone pinned stock source
         run: |
           set -euo pipefail
+
           git init kernel
+
           git -C kernel remote add origin \
             https://github.com/ChopinKernels/android_kernel_chopin_android_T.git
+
           git -C kernel fetch --depth=1 origin \
             0647a49c9557faa92b90c4ae188587787226be9e
+
           git -C kernel checkout --detach FETCH_HEAD
+
           git -C kernel rev-parse HEAD
+
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
 
       - name: Integrate pinned SukiSU Ultra
         working-directory: kernel
         run: |
           set -euo pipefail
+
+          # Download pinned SukiSU Ultra.
           git init KernelSU
-          git -C KernelSU fetch https://github.com/SukiSU-Ultra/SukiSU-Ultra.git de9bc7e6b46181f8b27ac7b96db946420838dd18
+
+          git -C KernelSU fetch \
+            https://github.com/SukiSU-Ultra/SukiSU-Ultra.git \
+            de9bc7e6b46181f8b27ac7b96db946420838dd18
+
           git -C KernelSU checkout --detach FETCH_HEAD
 
+          # Verify upstream header.
           echo '4e74a6beccf82890c691ff79ad7fac5156e7c164b51ff46f87986f8f0459eeb2  KernelSU/kernel/kernel_includes.h' | sha256sum -c -
+
           test -f include/linux/static_key.h
-          sed -i 's@#include <linux/static_call.h>@#include <linux/static_key.h>@' KernelSU/kernel/kernel_includes.h
 
-          cat > /tmp/sukisu-optional-compat.patch <<'SUKISU_COMPAT_PATCH'
-          --- a/kernel/ksu_main.c
-          +++ b/kernel/ksu_main.c
-          @@ -77,7 +77,7 @@
+          sed -i \
+            's@#include <linux/static_call.h>@#include <linux/static_key.h>@' \
+            KernelSU/kernel/kernel_includes.h
 
-           // unity build
-           #include "extension/extension.c"
-          -#include "extension/cpu_spoof.c"
-          +/* CPU spoof unavailable on chopin 4.14. */
-           #include "extension/umount_paths.c"
-           #include "extension/dynamic_manager.c"
-           #include "extension/kpm.c"
-          --- a/kernel/extension/extension.c
-          +++ b/kernel/extension/extension.c
-          @@ -524,14 +524,6 @@
-                   .ops = &ksu_extension_kpm_ops,
-                   .io_handler = ksu_extension_kpm_io,
-                   .apply_forced = ksu_extension_kpm_apply_forced,
-          -    };
-          -    static const struct ksu_extension_handler cpu_spoof_handler = {
-          -        .extension_id = KSU_EXTENSION_CPU_SPOOF,
-          -        .name = "cpu_spoof",
-          -        /* State lives in each ioctl payload; nothing to toggle or keep. */
-          -        .caps = 0,
-          -        .ops = NULL,
-          -        .io_handler = ksu_extension_cpu_spoof_io,
-               };
-               static const struct ksu_extension_handler umount_paths_handler = {
-          @@ -576,8 +568,7 @@
+          # Apply Linux 4.14 compatibility modifications.
+          python3 - <<'PY'
+          from pathlib import Path
 
-               if (ksu_register_extension_handler(&kpm_handler))
-                   pr_err("extension: failed to register kpm\n");
-          -    if (ksu_register_extension_handler(&cpu_spoof_handler))
-          -        pr_err("extension: failed to register cpu_spoof\n");
-          +    /* CPU spoof is not advertised on this build. */
-               if (ksu_register_extension_handler(&umount_paths_handler))
-                   pr_err("extension: failed to register umount_paths\n");
-          --- a/kernel/preinit/common/preinit.h
-          +++ b/kernel/preinit/common/preinit.h
-          @@ -2,7 +2,9 @@
-           #define __KSU_H_PREINIT
+          def replace_once(path, old, new, expected=1):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
 
-           #if !defined(CONFIG_ARM64) || !defined(KSU_CAN_USE_JUMP_LABEL)
-          +#ifndef KSU_NO_PREINIT
-           #define KSU_NO_PREINIT
-          +#endif
-           #endif
+              if count != expected:
+                  raise SystemExit(
+                      f"ERROR: {path}: expected {expected} matches, found {count}"
+                  )
 
-           #ifndef KSU_NO_PREINIT
-          SUKISU_COMPAT_PATCH
+              p.write_text(text.replace(old, new, expected))
+              print(f"PATCH OK: {path}")
 
-          git -C KernelSU apply --check /tmp/sukisu-optional-compat.patch
-          git -C KernelSU apply /tmp/sukisu-optional-compat.patch
+          # 1. Disable CPU spoof source inclusion.
+          replace_once(
+              "KernelSU/kernel/ksu_main.c",
+              '#include "extension/cpu_spoof.c"\n',
+              '/* CPU spoof disabled for Chopin 4.14. */\n'
+          )
 
-          # Linux 4.14 compatibility fixes
-          cat > /tmp/sukisu-linux-414-compat.patch <<'SUKISU_414_PATCH'
-          --- a/kernel/extension/kpm/kpm.c
-          +++ b/kernel/extension/kpm/kpm.c
-          @@ -179,7 +179,7 @@
-               int result;
-               /* Called only through the manager_or_root-authorized extension ioctl. */
-               if (copy_from_user(&cmd, arg, sizeof(cmd))) return -EFAULT;
-          -    if (!access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;
-          +    if (!access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;
-               result = handle_kpm(&cmd);
-               return copy_to_user(u64_to_user_ptr(cmd.result_code), &result, sizeof(result)) ? -EFAULT : 0;
-           }
-          --- a/kernel/supercall/dispatch.c
-          +++ b/kernel/supercall/dispatch.c
-          @@ -621,8 +621,8 @@
-               if (!cmd.count || cmd.count > KSU_LOOKUP_SYMBOLS_MAX)
-                   return -EINVAL;
+          # 2. Remove CPU spoof extension registration structure.
+          replace_once(
+              "KernelSU/kernel/extension/extension.c",
+              '''    static const struct ksu_extension_handler cpu_spoof_handler = {
+                  .extension_id = KSU_EXTENSION_CPU_SPOOF,
+                  .name = "cpu_spoof",
+                  /* State lives in each ioctl payload; nothing to toggle or keep. */
+                  .caps = 0,
+                  .ops = NULL,
+                  .io_handler = ksu_extension_cpu_spoof_io,
+              };
+          ''',
+              ''
+          )
 
-          -    names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
-          -    addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);
-          +    names = kcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
-          +    addrs = kcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);
-               if (!names || !addrs) {
-                   ret = -ENOMEM;
-                   goto out;
-           }
-          SUKISU_414_PATCH
+          # 3. Remove CPU spoof manager registration.
+          replace_once(
+              "KernelSU/kernel/extension/extension.c",
+              '''    if (ksu_register_extension_handler(&cpu_spoof_handler))
+                  pr_err("extension: failed to register cpu_spoof\\n");
+          ''',
+              ''
+          )
 
-          git -C KernelSU apply --check /tmp/sukisu-linux-414-compat.patch
-          git -C KernelSU apply /tmp/sukisu-linux-414-compat.patch
+          # 4. Avoid duplicate KSU_NO_PREINIT definition.
+          replace_once(
+              "KernelSU/kernel/preinit/common/preinit.h",
+              '''#if !defined(CONFIG_ARM64) || !defined(KSU_CAN_USE_JUMP_LABEL)
+          #define KSU_NO_PREINIT
+          #endif
+          ''',
+              '''#if !defined(CONFIG_ARM64) || !defined(KSU_CAN_USE_JUMP_LABEL)
+          #ifndef KSU_NO_PREINIT
+          #define KSU_NO_PREINIT
+          #endif
+          #endif
+          '''
+          )
 
-          echo "SukiSU Linux 4.14 compatibility patches applied."
+          # 5. Linux 4.14 access_ok compatibility.
+          replace_once(
+              "KernelSU/kernel/extension/kpm/kpm.c",
+              'access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))',
+              'access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))'
+          )
 
+          # 6. Replace kvcalloc with kcalloc.
+          replace_once(
+              "KernelSU/kernel/supercall/dispatch.c",
+              '''names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
+          addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);''',
+              '''names = kcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
+          addrs = kcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);'''
+          )
+
+          print("All source modifications completed.")
+          PY
+
+          # Verify modifications.
+          grep -n 'CPU spoof disabled' KernelSU/kernel/ksu_main.c
+
+          grep -n 'access_ok(VERIFY_WRITE' \
+            KernelSU/kernel/extension/kpm/kpm.c
+
+          grep -n 'names = kcalloc' \
+            KernelSU/kernel/supercall/dispatch.c
+
+          grep -n 'addrs = kcalloc' \
+            KernelSU/kernel/supercall/dispatch.c
+
+          if grep -n 'cpu_spoof_handler' \
+            KernelSU/kernel/extension/extension.c; then
+            echo "::error::CPU spoof registration still exists"
+            exit 1
+          fi
+
+          # Verify source changes.
+          git -C KernelSU diff --check
+          git -C KernelSU diff --stat
+
+          # Connect KernelSU to the stock kernel.
           ln -s ../KernelSU/kernel drivers/kernelsu
+
           printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+
           printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+
+          echo "SukiSU integration completed."
 
       - name: Apply pinned chopin manual hooks
         working-directory: kernel
         run: |
           set -euo pipefail
+
+          # Verify original source files.
           echo '9e0a0f61fde132dd1bbcdde36185904455a7a3e752ed0021b093af896cf4a76f  fs/exec.c' | sha256sum -c -
+
           echo '86c5f1065a816d0ad8ba85c76a535311aaff420c056c653db524d7dfd18a4e92  fs/open.c' | sha256sum -c -
+
           echo '331e95876a74f8f440462bfa3a9d5025a7b320127b9a60606bf5873f615adc36  fs/read_write.c' | sha256sum -c -
+
           echo '12170d9b3de439759f5e8772bb87a076d6548b947231344f2cbb1de358af28dd  fs/stat.c' | sha256sum -c -
+
           echo 'aa13476b66767f117fb5fbbd3cf6a35358f7252fa5bd146f87a07efefa3da9e9  kernel/reboot.c' | sha256sum -c -
 
           cat > /tmp/chopin-sukisu-hooks.patch <<'CHOPIN_PATCH'
@@ -306,13 +356,15 @@ jobs:
           +	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
           +#endif
 
-           	/* We only trust the superuser with rebooting the system. */
+           	/* We only trust the superuser with the ability to reboot. */
            	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
           CHOPIN_PATCH
 
           git apply --check /tmp/chopin-sukisu-hooks.patch
           git apply /tmp/chopin-sukisu-hooks.patch
+
           git diff --check
+
           git diff > manual-hooks-applied.patch
 
       - name: Configure and compile SukiSU Ultra kernel
@@ -331,16 +383,23 @@ jobs:
             CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
           )
 
+          # Configure kernel.
           make O=out "${args[@]}" chopin_user_defconfig 2>&1 | tee build.log
+
           test -s out/.config
 
-          scripts/config --file out/.config --set-str LOCALVERSION "-SukiSU" \
+          scripts/config --file out/.config \
+            --set-str LOCALVERSION "-SukiSU" \
             --enable OVERLAY_FS \
-            --enable KSU --enable EXT4_FS \
-            --disable KSU_SUSFS --disable KPM --disable KSU_FEATURE_ADBROOT
+            --enable KSU \
+            --enable EXT4_FS \
+            --disable KSU_SUSFS \
+            --disable KPM \
+            --disable KSU_FEATURE_ADBROOT
 
           make O=out "${args[@]}" olddefconfig 2>&1 | tee -a build.log
 
+          # Verify configuration.
           for option in OVERLAY_FS EXT4_FS KSU; do
             grep -x "CONFIG_${option}=y" out/.config | tee -a build.log
           done
@@ -349,30 +408,37 @@ jobs:
             grep -x "# CONFIG_${option} is not set" out/.config | tee -a build.log
           done
 
-          # Generate compile.h
+          # Generate compile.h.
           make O=out "${args[@]}" init/version.o 2>&1 | tee -a build.log
+
           test -s out/include/generated/compile.h
 
-          # Build SELinux first
+          # Build SELinux.
           make -j"$(nproc)" O=out "${args[@]}" security/selinux/ 2>&1 | tee -a build.log
+
           test -s out/security/selinux/flask.h
           test -s out/security/selinux/av_permissions.h
 
-          # Check SukiSU integration
+          # Build SukiSU.
           make -j"$(nproc)" O=out "${args[@]}" drivers/kernelsu/ 2>&1 | tee -a build.log
 
-          # Check manual hooks
+          # Build manual hooks.
           make -j"$(nproc)" O=out "${args[@]}" \
             fs/exec.o fs/open.o fs/stat.o fs/read_write.o kernel/reboot.o \
             2>&1 | tee -a build.log
 
-          # Full kernel build
+          # Full kernel build.
           make -j"$(nproc)" O=out "${args[@]}" Image.gz-dtb 2>&1 | tee -a build.log
 
-          awk '$3 == "kernelsu_init" { found=1; print } END { exit !found }' out/System.map | tee -a build.log
+          # Verify KernelSU symbol.
+          awk '$3 == "kernelsu_init" { found=1; print } END { exit !found }' \
+            out/System.map | tee -a build.log
 
+          # Verify output.
           image=out/arch/arm64/boot/Image.gz-dtb
+
           test -s "$image"
+
           ls -lh "$image" | tee -a build.log
           sha256sum "$image" | tee -a build.log
 
