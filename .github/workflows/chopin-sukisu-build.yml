@@ -1,10 +1,11 @@
 
-name: Chopin SukiSU Ultra builtin 4.14 Build
+name: Chopin SukiSU Ultra Builtin 4.14 Build
 
 on:
   workflow_dispatch:
   push:
-    branches: [chopin-sukisu]
+    branches:
+      - chopin-sukisu
     paths:
       - .github/workflows/chopin-sukisu-build.yml
 
@@ -21,29 +22,53 @@ jobs:
         shell: bash
 
     steps:
+
+      # ==========================================
+      # 1. Install dependencies
+      # ==========================================
+
       - name: Install dependencies
         run: |
           set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             bc bison build-essential ccache curl \
             device-tree-compiler flex git libelf-dev \
-            libncurses-dev libssl-dev lz4 make python3 tar
+            libncurses-dev libssl-dev lz4 make \
+            python3 rsync tar
+
+      # ==========================================
+      # 2. Download Android Clang 11
+      # ==========================================
 
       - name: Download Android Clang
         run: |
           set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/clang"
+
           curl -fLsS --retry 3 \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r383902.tar.gz" \
             -o "$RUNNER_TEMP/clang.tar.gz"
-          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
-          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/clang/lib64" >> "$GITHUB_ENV"
 
-      - name: Download and validate candidate Android GCC 4.9
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" \
+            -C "$RUNNER_TEMP/clang"
+
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/clang/lib64" \
+            >> "$GITHUB_ENV"
+
+      # ==========================================
+      # 3. Download Android GCC 4.9
+      # ==========================================
+
+      - name: Download Android GCC 4.9
         run: |
           set -euo pipefail
+
           base=https://android.googlesource.com/platform/prebuilts/gcc/linux-x86
           tag=android-9.0.0_r1
 
@@ -52,56 +77,71 @@ jobs:
             arm/arm-linux-androideabi-4.9; do
 
             dest="$RUNNER_TEMP/${toolchain##*/}"
-            mkdir -p "$dest"
 
-            echo "=== $toolchain at $tag ==="
+            mkdir -p "$dest"
 
             curl -fLsS --retry 3 \
               "$base/$toolchain/+archive/refs/tags/$tag.tar.gz" \
               -o "$dest/toolchain.tar.gz"
 
-            tar -xzf "$dest/toolchain.tar.gz" -C "$dest"
+            tar -xzf "$dest/toolchain.tar.gz" \
+              -C "$dest"
 
             compiler="$dest/bin/${toolchain##*/}"
+
             compiler="${compiler%-4.9}-gcc"
 
-            if [[ ! -x "$compiler" ]]; then
-              echo "::error::Missing executable $compiler"
-              exit 1
-            fi
+            test -x "$compiler"
 
             prefix="${compiler%gcc}"
 
             "$compiler" --version
+
             target=$("$compiler" -dumpmachine)
 
-            echo "Compiler target: $target"
-
             case "$toolchain:$target" in
+
               aarch64/*:aarch64-*)
-                test -x "${prefix}elfedit" || {
-                  echo "::error::Missing elfedit"
-                  exit 1
-                }
-                echo "CROSS_COMPILE=$prefix" >> "$GITHUB_ENV"
+                test -x "${prefix}elfedit"
+
+                echo "CROSS_COMPILE=$prefix" \
+                  >> "$GITHUB_ENV"
                 ;;
+
               arm/*:arm-*)
-                echo "CROSS_COMPILE_ARM32=$prefix" >> "$GITHUB_ENV"
+                echo "CROSS_COMPILE_ARM32=$prefix" \
+                  >> "$GITHUB_ENV"
                 ;;
+
               *)
-                echo "::error::Unexpected compiler target $target"
+                echo "::error::Unexpected compiler target: $target"
                 exit 1
                 ;;
             esac
 
             dirname "$compiler" >> "$GITHUB_PATH"
+
           done
 
-      - name: Verify Clang and LLD
+      # ==========================================
+      # 4. Verify toolchains
+      # ==========================================
+
+      - name: Verify toolchains
         run: |
           set -euo pipefail
+
           clang --version
+
           ld.lld --version
+
+          aarch64-linux-android-gcc --version
+
+          arm-linux-androideabi-gcc --version
+
+      # ==========================================
+      # 5. Download Chopin kernel source
+      # ==========================================
 
       - name: Clone pinned stock source
         run: |
@@ -117,58 +157,73 @@ jobs:
 
           git -C kernel checkout --detach FETCH_HEAD
 
+          echo "=== Kernel commit ==="
+
           git -C kernel rev-parse HEAD
 
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
+          echo "=== Kernel version ==="
+
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' \
+            kernel/Makefile
+
+          test -f kernel/arch/arm64/configs/chopin_user_defconfig
+
+      # ==========================================
+      # 6. Integrate SukiSU Ultra
+      # ==========================================
 
       - name: Integrate pinned SukiSU Ultra
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          # Download pinned SukiSU Ultra.
           git init KernelSU
 
-          git -C KernelSU fetch \
+          git -C KernelSU fetch --depth=1 \
             https://github.com/SukiSU-Ultra/SukiSU-Ultra.git \
             de9bc7e6b46181f8b27ac7b96db946420838dd18
 
           git -C KernelSU checkout --detach FETCH_HEAD
 
-          # Verify upstream header.
-          echo '4e74a6beccf82890c691ff79ad7fac5156e7c164b51ff46f87986f8f0459eeb2  KernelSU/kernel/kernel_includes.h' | sha256sum -c -
+          echo '4e74a6beccf82890c691ff79ad7fac5156e7c164b51ff46f87986f8f0459eeb2  KernelSU/kernel/kernel_includes.h' \
+            | sha256sum -c -
 
+          # Linux 4.14 does not provide static_call.h.
           test -f include/linux/static_key.h
 
           sed -i \
             's@#include <linux/static_call.h>@#include <linux/static_key.h>@' \
             KernelSU/kernel/kernel_includes.h
 
-          # Apply Linux 4.14 compatibility modifications.
+          # Apply compatibility modifications.
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          def replace_once(path, old, new, expected=1):
+          def replace_once(path, old, new):
               p = Path(path)
-              text = p.read_text()
-              count = text.count(old)
 
-              if count != expected:
+              source = p.read_text()
+
+              count = source.count(old)
+
+              if count != 1:
                   raise SystemExit(
-                      f"ERROR: {path}: expected {expected} matches, found {count}"
+                      f"ERROR: {path}: expected 1 match, found {count}"
                   )
 
-              p.write_text(text.replace(old, new, expected))
+              p.write_text(source.replace(old, new, 1))
+
               print(f"PATCH OK: {path}")
 
-          # 1. Disable CPU spoof source inclusion.
+          # 1. Disable CPU spoof implementation.
           replace_once(
               "KernelSU/kernel/ksu_main.c",
               '#include "extension/cpu_spoof.c"\n',
               '/* CPU spoof disabled for Chopin 4.14. */\n'
           )
 
-          # 2. Remove CPU spoof extension registration structure.
+          # 2. Remove CPU spoof handler.
           replace_once(
               "KernelSU/kernel/extension/extension.c",
               '''    static const struct ksu_extension_handler cpu_spoof_handler = {
@@ -183,7 +238,7 @@ jobs:
               ''
           )
 
-          # 3. Remove CPU spoof manager registration.
+          # 3. Remove CPU spoof registration.
           replace_once(
               "KernelSU/kernel/extension/extension.c",
               '''    if (ksu_register_extension_handler(&cpu_spoof_handler))
@@ -192,7 +247,7 @@ jobs:
               ''
           )
 
-          # 4. Avoid duplicate KSU_NO_PREINIT definition.
+          # 4. Protect KSU_NO_PREINIT definition.
           replace_once(
               "KernelSU/kernel/preinit/common/preinit.h",
               '''#if !defined(CONFIG_ARM64) || !defined(KSU_CAN_USE_JUMP_LABEL)
@@ -214,242 +269,510 @@ jobs:
               'access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))'
           )
 
-          # 6. Replace kvcalloc with kcalloc.
-          replace_once(
-              "KernelSU/kernel/supercall/dispatch.c",
-              '''names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
-          addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);''',
-              '''names = kcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
-          addrs = kcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);'''
+          # 6. Linux 4.14 kvcalloc compatibility.
+          # Use kvmalloc_array with GFP_ZERO semantics.
+          dispatch = Path(
+              "KernelSU/kernel/supercall/dispatch.c"
           )
 
-          print("All source modifications completed.")
+          source = dispatch.read_text()
+
+          pattern = re.compile(
+              r"(?m)^"
+              r"(?P<indent>[ \t]*)"
+              r"(?P<name>names|addrs) = "
+              r"kvcalloc\(cmd\.count, sizeof\(\*(?P=name)\), GFP_KERNEL\);$"
+          )
+
+          def replace_alloc(match):
+              name = match.group("name")
+
+              return (
+                  match.group("indent")
+                  + f"{name} = kvmalloc_array("
+                  + f"cmd.count, sizeof(*{name}), "
+                  + "GFP_KERNEL | __GFP_ZERO);"
+              )
+
+          source, count = pattern.subn(
+              replace_alloc,
+              source
+          )
+
+          if count != 2:
+              raise SystemExit(
+                  "ERROR: dispatch.c: expected 2 kvcalloc calls, "
+                  f"replaced {count}"
+              )
+
+          dispatch.write_text(source)
+
+          print("PATCH OK: dispatch.c")
+
+          print("All SukiSU compatibility patches completed.")
+
           PY
 
-          # Verify modifications.
-          grep -n 'CPU spoof disabled' KernelSU/kernel/ksu_main.c
+          # Verify all modifications.
+
+          grep -n 'CPU spoof disabled' \
+            KernelSU/kernel/ksu_main.c
 
           grep -n 'access_ok(VERIFY_WRITE' \
             KernelSU/kernel/extension/kpm/kpm.c
 
-          grep -n 'names = kcalloc' \
+          grep -n 'kvmalloc_array(cmd.count' \
             KernelSU/kernel/supercall/dispatch.c
 
-          grep -n 'addrs = kcalloc' \
-            KernelSU/kernel/supercall/dispatch.c
-
-          if grep -n 'cpu_spoof_handler' \
-            KernelSU/kernel/extension/extension.c; then
-            echo "::error::CPU spoof registration still exists"
+          if grep -n 'kvcalloc(' \
+            KernelSU/kernel/supercall/dispatch.c; then
+            echo "::error::kvcalloc remains"
             exit 1
           fi
 
-          # Verify source changes.
+          if grep -n 'cpu_spoof_handler' \
+            KernelSU/kernel/extension/extension.c; then
+            echo "::error::CPU spoof registration remains"
+            exit 1
+          fi
+
+          if grep -n 'static_call.h' \
+            KernelSU/kernel/kernel_includes.h; then
+            echo "::error::static_call.h remains"
+            exit 1
+          fi
+
           git -C KernelSU diff --check
+
           git -C KernelSU diff --stat
 
-          # Connect KernelSU to the stock kernel.
+          # Connect SukiSU to the kernel.
           ln -s ../KernelSU/kernel drivers/kernelsu
 
-          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' \
+            >> drivers/Makefile
 
-          printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+          printf '\nsource "drivers/kernelsu/Kconfig"\n' \
+            >> drivers/Kconfig
 
           echo "SukiSU integration completed."
 
-      - name: Apply pinned chopin manual hooks
+      # ==========================================
+      # 7. Apply manual hooks
+      # ==========================================
+
+      - name: Apply Chopin manual hooks
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          # Verify original source files.
-          echo '9e0a0f61fde132dd1bbcdde36185904455a7a3e752ed0021b093af896cf4a76f  fs/exec.c' | sha256sum -c -
+          python3 - <<'PY'
+          from pathlib import Path
 
-          echo '86c5f1065a816d0ad8ba85c76a535311aaff420c056c653db524d7dfd18a4e92  fs/open.c' | sha256sum -c -
+          def replace_once(path, old, new):
+              p = Path(path)
 
-          echo '331e95876a74f8f440462bfa3a9d5025a7b320127b9a60606bf5873f615adc36  fs/read_write.c' | sha256sum -c -
+              source = p.read_text()
 
-          echo '12170d9b3de439759f5e8772bb87a076d6548b947231344f2cbb1de358af28dd  fs/stat.c' | sha256sum -c -
+              count = source.count(old)
 
-          echo 'aa13476b66767f117fb5fbbd3cf6a35358f7252fa5bd146f87a07efefa3da9e9  kernel/reboot.c' | sha256sum -c -
+              if count != 1:
+                  raise SystemExit(
+                      f"ERROR: {path}: expected 1 match, found {count}"
+                  )
 
-          cat > /tmp/chopin-sukisu-hooks.patch <<'CHOPIN_PATCH'
-          --- a/fs/exec.c
-          +++ b/fs/exec.c
-          @@ -1710,6 +1710,11 @@
-           	if (IS_ERR(filename))
-           		return PTR_ERR(filename);
+              p.write_text(source.replace(old, new, 1))
 
-          +#ifdef CONFIG_KSU
-          +	extern int ksu_handle_execveat(int *, struct filename **, void *, void *, int *);
-          +	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
-          +#endif
-          +
-           	/*
-           	 * We move the actual failure in case of RLIMIT_NPROC excess from
-           	 * set*uid() to execve() because too many poorly written programs
-          --- a/fs/open.c
-          +++ b/fs/open.c
-          @@ -369,6 +369,11 @@
-           	int res;
-           	unsigned int lookup_flags = LOOKUP_FOLLOW;
+              print(f"HOOK OK: {path}")
 
-          +#ifdef CONFIG_KSU
-          +	extern int ksu_handle_faccessat(int *, const char __user **, int *, int *);
-          +	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          +#endif
-          +
-           	if (mode & ~S_IRWXO)
-           		return -EINVAL;
-          --- a/fs/read_write.c
-          +++ b/fs/read_write.c
-          @@ -573,6 +573,13 @@
-           	struct fd f = fdget_pos(fd);
-           	ssize_t ret = -EBADF;
+          # ----------------------------------------
+          # 1. execveat
+          # ----------------------------------------
 
-          +#ifdef CONFIG_KSU
-          +	extern bool ksu_vfs_read_hook;
-          +	extern int ksu_handle_sys_read(unsigned int, char __user **, size_t *);
-          +	if (unlikely(ksu_vfs_read_hook))
-          +		ksu_handle_sys_read(fd, &buf, &count);
-          +#endif
-          +
-           	if (f.file) {
-           		loff_t pos = file_pos_read(f.file);
-           		ret = vfs_read(f.file, buf, count, &pos);
-          --- a/fs/stat.c
-          +++ b/fs/stat.c
-          @@ -144,6 +144,12 @@
-           				    request_mask, query_flags);
-           		fdput(f);
-           	}
-          +#ifdef CONFIG_KSU
-          +	extern void ksu_handle_vfs_fstat(int, loff_t *);
-          +	if (!error)
-          +		ksu_handle_vfs_fstat(fd, &stat->size);
-          +#endif
-          +
-           	return error;
-           }
-           EXPORT_SYMBOL(vfs_statx_fd);
-          @@ -169,6 +175,11 @@
-           	struct path path;
-           	int error = -EINVAL;
-           	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
-          +
-          +#ifdef CONFIG_KSU
-          +	extern int ksu_handle_stat(int *, const char __user **, int *);
-          +	ksu_handle_stat(&dfd, &filename, &flags);
-          +#endif
+          replace_once(
+              "fs/exec.c",
+              "\tif (IS_ERR(filename))\n"
+              "\t\treturn PTR_ERR(filename);\n\n",
 
-           	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
-           		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
-          --- a/kernel/reboot.c
-          +++ b/kernel/reboot.c
-          @@ -290,6 +290,11 @@
-           	struct pid_namespace *pid_ns = task_active_pid_ns(current);
-           	char buffer[256];
-           	int ret = 0;
-          +
-          +#ifdef CONFIG_KSU
-          +	extern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);
-          +	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-          +#endif
+              "\tif (IS_ERR(filename))\n"
+              "\t\treturn PTR_ERR(filename);\n\n"
+              "#ifdef CONFIG_KSU\n"
+              "\textern int ksu_handle_execveat(int *, struct filename **, void *, void *, int *);\n"
+              "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+              "#endif\n\n"
+          )
 
-           	/* We only trust the superuser with the ability to reboot. */
-           	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
-          CHOPIN_PATCH
+          # ----------------------------------------
+          # 2. faccessat
+          # ----------------------------------------
 
-          git apply --check /tmp/chopin-sukisu-hooks.patch
-          git apply /tmp/chopin-sukisu-hooks.patch
+          replace_once(
+              "fs/open.c",
 
+              "\tint res;\n"
+              "\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\n"
+              "\tif (mode & ~S_IRWXO)",
+
+              "\tint res;\n"
+              "\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\n"
+              "#ifdef CONFIG_KSU\n"
+              "\textern int ksu_handle_faccessat(int *, const char __user **, int *, int *);\n"
+              "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+              "#endif\n\n"
+              "\tif (mode & ~S_IRWXO)"
+          )
+
+          # ----------------------------------------
+          # 3. read syscall
+          # ----------------------------------------
+
+          read_anchor = (
+              "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n"
+              "{\n"
+              "\tstruct fd f = fdget_pos(fd);\n"
+              "\tssize_t ret = -EBADF;\n\n"
+          )
+
+          read_hook = (
+              "#ifdef CONFIG_KSU\n"
+              "\textern bool ksu_vfs_read_hook;\n"
+              "\textern int ksu_handle_sys_read(unsigned int, char __user **, size_t *);\n"
+              "\tif (unlikely(ksu_vfs_read_hook))\n"
+              "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+              "#endif\n\n"
+          )
+
+          replace_once(
+              "fs/read_write.c",
+              read_anchor,
+              read_anchor + read_hook
+          )
+
+          # ----------------------------------------
+          # 4. fstat
+          # ----------------------------------------
+
+          replace_once(
+              "fs/stat.c",
+
+              "\t\t\t\t    request_mask, query_flags);\n"
+              "\t\tfdput(f);\n"
+              "\t}\n"
+              "\treturn error;\n",
+
+              "\t\t\t\t    request_mask, query_flags);\n"
+              "\t\tfdput(f);\n"
+              "\t}\n"
+              "#ifdef CONFIG_KSU\n"
+              "\textern void ksu_handle_vfs_fstat(int, loff_t *);\n"
+              "\tif (!error)\n"
+              "\t\tksu_handle_vfs_fstat(fd, &stat->size);\n"
+              "#endif\n"
+              "\treturn error;\n"
+          )
+
+          # ----------------------------------------
+          # 5. stat / newfstatat
+          # ----------------------------------------
+
+          stat_anchor = (
+              "\tstruct path path;\n"
+              "\tint error = -EINVAL;\n"
+              "\tunsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;\n\n"
+          )
+
+          stat_hook = (
+              "#ifdef CONFIG_KSU\n"
+              "\textern int ksu_handle_stat(int *, const char __user **, int *);\n"
+              "\tksu_handle_stat(&dfd, &filename, &flags);\n"
+              "#endif\n\n"
+          )
+
+          replace_once(
+              "fs/stat.c",
+              stat_anchor,
+              stat_anchor + stat_hook
+          )
+
+          print("All manual hooks applied successfully.")
+
+          PY
+
+          # Validate patch formatting.
           git diff --check
 
+          # Save the applied patch.
           git diff > manual-hooks-applied.patch
 
-      - name: Configure and compile SukiSU Ultra kernel
+          git diff --stat
+
+      # ==========================================
+      # 8. Configure kernel
+      # ==========================================
+
+      - name: Configure Chopin kernel
         working-directory: kernel
         run: |
           set -euo pipefail
 
           args=(
             ARCH=arm64
-            HOSTCC=gcc HOSTCXX=g++
-            CC=clang LD=ld.lld
-            AR=llvm-ar NM=llvm-nm
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+            HOSTCC=gcc
+            HOSTCXX=g++
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE="$CROSS_COMPILE"
             CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
           )
 
-          # Configure kernel.
-          make O=out "${args[@]}" chopin_user_defconfig 2>&1 | tee build.log
+          # Load device configuration.
+          make O=out "${args[@]}" \
+            chopin_user_defconfig \
+            2>&1 | tee build.log
 
           test -s out/.config
 
+          # Configure SukiSU.
           scripts/config --file out/.config \
             --set-str LOCALVERSION "-SukiSU" \
             --enable OVERLAY_FS \
-            --enable KSU \
             --enable EXT4_FS \
+            --enable KSU \
+            --enable KALLSYMS \
+            --enable KALLSYMS_ALL \
             --disable KSU_SUSFS \
             --disable KPM \
-            --disable KSU_FEATURE_ADBROOT
+            --disable KSU_FEATURE_ADBROOT \
+            --disable KSU_DEBUG
 
-          make O=out "${args[@]}" olddefconfig 2>&1 | tee -a build.log
+          make O=out "${args[@]}" \
+            olddefconfig \
+            2>&1 | tee -a build.log
 
-          # Verify configuration.
-          for option in OVERLAY_FS EXT4_FS KSU; do
-            grep -x "CONFIG_${option}=y" out/.config | tee -a build.log
+          # Verify required configuration.
+          for option in \
+            OVERLAY_FS \
+            EXT4_FS \
+            KSU \
+            KALLSYMS \
+            KALLSYMS_ALL; do
+
+            grep -qx "CONFIG_${option}=y" out/.config \
+              || {
+                echo "::error::CONFIG_${option} is not enabled"
+                exit 1
+              }
+
           done
 
-          for option in KSU_SUSFS KPM KSU_FEATURE_ADBROOT; do
-            grep -x "# CONFIG_${option} is not set" out/.config | tee -a build.log
+          # Verify disabled components.
+          for option in \
+            KSU_SUSFS \
+            KPM \
+            KSU_FEATURE_ADBROOT \
+            KSU_DEBUG; do
+
+            grep -qx "# CONFIG_${option} is not set" out/.config \
+              || {
+                echo "::error::CONFIG_${option} is not disabled"
+                exit 1
+              }
+
           done
 
           # Generate compile.h.
-          make O=out "${args[@]}" init/version.o 2>&1 | tee -a build.log
+          make O=out "${args[@]}" \
+            init/version.o \
+            2>&1 | tee -a build.log
 
           test -s out/include/generated/compile.h
 
-          # Build SELinux.
-          make -j"$(nproc)" O=out "${args[@]}" security/selinux/ 2>&1 | tee -a build.log
+      # ==========================================
+      # 9. Build SELinux
+      # ==========================================
 
-          test -s out/security/selinux/flask.h
-          test -s out/security/selinux/av_permissions.h
+      - name: Build SELinux
+        working-directory: kernel
+        run: |
+          set -euo pipefail
 
-          # Build SukiSU.
-          make -j"$(nproc)" O=out "${args[@]}" drivers/kernelsu/ 2>&1 | tee -a build.log
+          args=(
+            ARCH=arm64
+            HOSTCC=gcc
+            HOSTCXX=g++
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
+          )
 
-          # Build manual hooks.
           make -j"$(nproc)" O=out "${args[@]}" \
-            fs/exec.o fs/open.o fs/stat.o fs/read_write.o kernel/reboot.o \
+            security/selinux/ \
             2>&1 | tee -a build.log
 
-          # Full kernel build.
-          make -j"$(nproc)" O=out "${args[@]}" Image.gz-dtb 2>&1 | tee -a build.log
+          test -s out/security/selinux/flask.h
 
-          # Verify KernelSU symbol.
-          awk '$3 == "kernelsu_init" { found=1; print } END { exit !found }' \
-            out/System.map | tee -a build.log
+          test -s out/security/selinux/av_permissions.h
 
-          # Verify output.
+      # ==========================================
+      # 10. Build SukiSU
+      # ==========================================
+
+      - name: Build SukiSU Ultra
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          args=(
+            ARCH=arm64
+            HOSTCC=gcc
+            HOSTCXX=g++
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
+          )
+
+          make -j"$(nproc)" O=out "${args[@]}" \
+            drivers/kernelsu/ \
+            2>&1 | tee -a build.log
+
+      # ==========================================
+      # 11. Compile manual hook files
+      # ==========================================
+
+      - name: Compile manual hook objects
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          args=(
+            ARCH=arm64
+            HOSTCC=gcc
+            HOSTCXX=g++
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
+          )
+
+          make -j"$(nproc)" O=out "${args[@]}" \
+            fs/exec.o \
+            fs/open.o \
+            fs/read_write.o \
+            fs/stat.o \
+            2>&1 | tee -a build.log
+
+      # ==========================================
+      # 12. Full kernel build
+      # ==========================================
+
+      - name: Build complete Chopin kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          args=(
+            ARCH=arm64
+            HOSTCC=gcc
+            HOSTCXX=g++
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32"
+          )
+
+          make -j"$(nproc)" O=out "${args[@]}" \
+            Image.gz-dtb \
+            2>&1 | tee -a build.log
+
+          # Verify KernelSU initialization symbol.
+          awk '$3 == "kernelsu_init" {
+            found=1
+            print
+          } END {
+            exit !found
+          }' out/System.map | tee -a build.log
+
+          # Verify manual hook symbols.
+          for symbol in \
+            ksu_handle_execveat \
+            ksu_handle_faccessat \
+            ksu_handle_stat \
+            ksu_handle_sys_read \
+            ksu_handle_vfs_fstat; do
+
+            awk -v s="$symbol" '
+              $3 == s {
+                found=1
+                print
+              }
+              END {
+                exit !found
+              }
+            ' out/System.map | tee -a build.log
+
+          done
+
+          # Verify kernel image.
           image=out/arch/arm64/boot/Image.gz-dtb
 
           test -s "$image"
 
-          ls -lh "$image" | tee -a build.log
+          echo "=== Kernel image ==="
+
+          ls -lh "$image"
+
+          echo "=== SHA256 ==="
+
           sha256sum "$image" | tee -a build.log
 
-      - name: Upload verified SukiSU Ultra kernel image
+      # ==========================================
+      # 13. Upload kernel image
+      # ==========================================
+
+      - name: Upload Chopin SukiSU kernel
         uses: actions/upload-artifact@v4
         with:
           name: chopin-sukisu-kernel-image
           path: kernel/out/arch/arm64/boot/Image.gz-dtb
           if-no-files-found: error
 
-      - name: Upload SukiSU Ultra kernel logs and configuration
+      # ==========================================
+      # 14. Upload build evidence
+      # ==========================================
+
+      - name: Upload build logs and configuration
         if: always()
         uses: actions/upload-artifact@v4
         with:
